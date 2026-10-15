@@ -6,6 +6,10 @@ import type { SonarrSeries } from '@server/api/servarr/sonarr';
 import { getRepository } from '@server/datasource';
 import { OverlayLibraryConfig } from '@server/entity/OverlayLibraryConfig';
 import { OverlayTemplate } from '@server/entity/OverlayTemplate';
+import {
+  findCustomPoster,
+  hasCustomFolder,
+} from '@server/lib/overlays/CustomPosterService';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import fs from 'fs/promises';
@@ -954,12 +958,19 @@ class OverlayLibraryService {
         const posterSource = settings.overlays?.defaultPosterSource || 'tmdb';
         const basePosterSourceChanged =
           metadata?.basePosterSource !== posterSource;
+        // Affiches personnalisées: a poster dropped in, replaced or removed.
+        const custom = await findCustomPoster(libraryName, item.title);
+        const customPosterChanged = custom
+          ? custom.mtime !== metadata?.localPosterModifiedTime ||
+            !metadata?.originalPlexPosterUrl?.startsWith('custom://')
+          : !!metadata?.originalPlexPosterUrl?.startsWith('custom://');
 
         if (
           !forceResync &&
           !overlayInputsChanged &&
           !plexPosterMissing &&
-          !basePosterSourceChanged
+          !basePosterSourceChanged &&
+          !customPosterChanged
         ) {
           logger.debug('Nothing changed, skipping overlay application', {
             label: 'OverlayLibrary',
@@ -968,16 +979,22 @@ class OverlayLibraryService {
             overlayInputsChanged: false,
             plexPosterMissing: false,
             basePosterSourceChanged: false,
+            customPosterChanged: false,
           });
           // Even when the show poster is unchanged, still check seasons —
           // a new season may have been added since the last run.
-          if (applyToSeasons && item.type === 'show' && tmdbId) {
+          if (
+            applyToSeasons &&
+            item.type === 'show' &&
+            (tmdbId || (await hasCustomFolder(libraryName, item.title)))
+          ) {
             await this.applyOverlaysToShowSeasons(
               plexApi,
               item,
               context,
               templates,
               libraryId,
+              libraryName,
               tmdbId,
               forceResync
             );
@@ -991,6 +1008,7 @@ class OverlayLibraryService {
           overlayInputsChanged,
           plexPosterMissing,
           basePosterSourceChanged,
+          customPosterChanged,
         });
       } catch (metaError) {
         logger.warn('Metadata check failed, proceeding with overlay', {
@@ -1214,13 +1232,18 @@ class OverlayLibraryService {
       }
 
       // Apply overlays to seasons when requested for show-type items
-      if (applyToSeasons && item.type === 'show' && tmdbId) {
+      if (
+        applyToSeasons &&
+        item.type === 'show' &&
+        (tmdbId || (await hasCustomFolder(libraryName, item.title)))
+      ) {
         await this.applyOverlaysToShowSeasons(
           plexApi,
           item,
           context,
           templates,
           libraryId,
+          libraryName,
           tmdbId,
           forceResync
         );
@@ -1248,7 +1271,8 @@ class OverlayLibraryService {
     showContext: OverlayRenderContext,
     templates: OverlayTemplate[],
     libraryId: string,
-    showTmdbId: number,
+    libraryName: string,
+    showTmdbId: number | undefined,
     forceResync?: boolean
   ): Promise<void> {
     let seasons: PlexMetadata[];
@@ -1366,12 +1390,23 @@ class OverlayLibraryService {
         );
         const basePosterSourceChanged =
           seasonMetadata?.basePosterSource !== posterSource;
+        // Affiches personnalisées: "Saison 01.jpg" in the show's custom folder.
+        const customSeason = await findCustomPoster(
+          libraryName,
+          showItem.title,
+          seasonNumber
+        );
+        const customPosterChanged = customSeason
+          ? customSeason.mtime !== seasonMetadata?.localPosterModifiedTime ||
+            !seasonMetadata?.originalPlexPosterUrl?.startsWith('custom://')
+          : !!seasonMetadata?.originalPlexPosterUrl?.startsWith('custom://');
 
         if (
           !forceResync &&
           seasonMetadata?.lastOverlayInputHash === overlayInputHash &&
           !plexPosterMissing &&
-          !basePosterSourceChanged
+          !basePosterSourceChanged &&
+          !customPosterChanged
         ) {
           logger.debug('Season unchanged, skipping', {
             label: 'OverlayLibrary',
@@ -1391,15 +1426,17 @@ class OverlayLibraryService {
 
         // Get season poster buffer
         const plexThumb = (season as { thumb?: string }).thumb;
-        const posterBuffer = await plexBasePosterManager.getSeasonPosterBuffer(
-          plexApi,
-          showTmdbId,
-          seasonNumber,
-          seasonRatingKey,
-          language,
-          posterSource as 'tmdb' | 'plex' | 'local',
-          plexThumb
-        );
+        const posterBuffer = customSeason
+          ? await fs.readFile(customSeason.path)
+          : await plexBasePosterManager.getSeasonPosterBuffer(
+              plexApi,
+              showTmdbId,
+              seasonNumber,
+              seasonRatingKey,
+              language,
+              posterSource as 'tmdb' | 'plex' | 'local',
+              plexThumb
+            );
 
         if (!posterBuffer) {
           logger.warn('No poster available for season, skipping', {
@@ -1472,9 +1509,11 @@ class OverlayLibraryService {
                   posterSource === 'local'
                     ? 'tmdb'
                     : (posterSource as 'tmdb' | 'plex'),
-                originalPlexPosterUrl: currentPosterUrl || '',
+                originalPlexPosterUrl: customSeason
+                  ? `custom://${customSeason.path}`
+                  : currentPosterUrl || '',
                 basePosterFilename: '',
-                localPosterModifiedTime: undefined,
+                localPosterModifiedTime: customSeason?.mtime,
               }
             );
           }

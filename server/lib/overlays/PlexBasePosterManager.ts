@@ -1,5 +1,9 @@
 import type PlexAPI from '@server/api/plexapi';
 import type { PlexLibraryItem } from '@server/api/plexapi';
+import {
+  ensureCustomFolder,
+  findCustomPoster,
+} from '@server/lib/overlays/CustomPosterService';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import axios from 'axios';
@@ -743,6 +747,22 @@ class PlexBasePosterManager {
       });
     }
 
+    // ===== AFFICHES PERSONNALISÉES =====
+    // A poster dropped in config/custom-posters/<library>/<title>/ wins over
+    // every source (CustomPosterService). Change detection: its file time.
+    const custom = await findCustomPoster(libraryName, item.title);
+    if (custom) {
+      return {
+        posterBuffer: await fs.readFile(custom.path),
+        basePosterChanged:
+          custom.mtime !== metadata.localPosterModifiedTime ||
+          !metadata.originalPlexPosterUrl?.startsWith('custom://'),
+        sourceUrl: `custom://${custom.path}`,
+        filename: '',
+        fileModTime: custom.mtime,
+      };
+    }
+
     // ===== FORCE REFRESH =====
     // Bypass all cache/URL checks and download a fresh poster from TMDB.
     // Used during forceResync after the cached base poster file has been deleted.
@@ -759,7 +779,11 @@ class PlexBasePosterManager {
       if (resolvedTmdbId) {
         const { getTmdbLanguage } = await import('@server/lib/settings');
         const language = await getTmdbLanguage(libraryId);
-        const posterUrl = await this.getTmdbPosterUrl(resolvedTmdbId, mediaType, language);
+        const posterUrl = await this.getTmdbPosterUrl(
+          resolvedTmdbId,
+          mediaType,
+          language
+        );
         if (posterUrl) {
           logger.debug('Force refresh: downloading fresh TMDB poster', {
             label: 'PlexBasePosterManager',
@@ -767,18 +791,32 @@ class PlexBasePosterManager {
             ratingKey: item.ratingKey,
           });
           const cachedPoster = await this.getTmdbCachedPoster(posterUrl);
-          const posterBuffer = cachedPoster ?? await this.downloadFromTMDB(posterUrl);
-          if (!cachedPoster) await this.storeTmdbCachedPoster(posterUrl, posterBuffer);
-          const filename = await this.storeBasePoster(posterBuffer, libraryId, item.ratingKey);
-          return { posterBuffer, basePosterChanged: true, sourceUrl: posterUrl, filename };
+          const posterBuffer =
+            cachedPoster ?? (await this.downloadFromTMDB(posterUrl));
+          if (!cachedPoster)
+            await this.storeTmdbCachedPoster(posterUrl, posterBuffer);
+          const filename = await this.storeBasePoster(
+            posterBuffer,
+            libraryId,
+            item.ratingKey
+          );
+          return {
+            posterBuffer,
+            basePosterChanged: true,
+            sourceUrl: posterUrl,
+            filename,
+          };
         }
       }
 
-      logger.warn('Force refresh: no TMDB poster available, falling through to normal logic', {
-        label: 'PlexBasePosterManager',
-        itemTitle: item.title,
-        ratingKey: item.ratingKey,
-      });
+      logger.warn(
+        'Force refresh: no TMDB poster available, falling through to normal logic',
+        {
+          label: 'PlexBasePosterManager',
+          itemTitle: item.title,
+          ratingKey: item.ratingKey,
+        }
+      );
       // Fall through to normal logic if TMDB unavailable
     }
 
@@ -973,7 +1011,10 @@ class PlexBasePosterManager {
       }
 
       if (!resolvedTmdbId) {
-        throw new Error('No TMDB ID found for item');
+        await ensureCustomFolder(libraryName, item.title);
+        throw new Error(
+          'No TMDB ID found for item (drop a poster in config/custom-posters to use your own)'
+        );
       }
 
       // Log TMDB fetch details for debugging wrong poster issues
@@ -999,6 +1040,7 @@ class PlexBasePosterManager {
       );
 
       if (!posterUrl) {
+        await ensureCustomFolder(libraryName, item.title);
         throw new Error('No TMDB poster available');
       }
 
@@ -1151,7 +1193,7 @@ class PlexBasePosterManager {
    */
   async getSeasonPosterBuffer(
     plexApi: PlexAPI,
-    showTmdbId: number,
+    showTmdbId: number | undefined,
     seasonNumber: number,
     seasonRatingKey: string,
     language: string,
@@ -1180,6 +1222,8 @@ class PlexBasePosterManager {
 
     // TMDB or local source: try TMDB season-specific poster first
     try {
+      // No TMDB id (fan edits…): straight to the Plex fallback below.
+      if (!showTmdbId) throw new Error('show has no TMDB id');
       const TheMovieDb = (await import('@server/api/themoviedb')).default;
       const tmdbClient = new TheMovieDb();
 
