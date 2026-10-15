@@ -115,7 +115,13 @@ export async function ensureCustomFolder(
   title: string
 ): Promise<void> {
   try {
-    await fs.mkdir(customFolder(libraryName, title), { recursive: true });
+    const folder = customFolder(libraryName, title);
+    await fs.mkdir(folder, { recursive: true });
+    // Writable by the host user's group (Posterarr runs as root in Docker):
+    // the folders exist so that you can drop posters in them.
+    for (const dir of [ROOT, path.dirname(folder), folder]) {
+      await fs.chmod(dir, 0o2775).catch(() => undefined);
+    }
     await fs
       .writeFile(path.join(ROOT, 'LISEZ-MOI.txt'), README, { flag: 'wx' })
       .catch(() => undefined);
