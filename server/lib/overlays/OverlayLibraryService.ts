@@ -43,6 +43,7 @@ class OverlayLibraryService {
   private radarrMoviesCache?: Map<string, RadarrMovie[]>;
   private sonarrSeriesCache?: Map<string, SonarrSeries[]>;
   private maintainerrCollectionsCache?: MaintainerrCollection[];
+  private maintainerrCollectionsFetchedAt = 0;
   // Maps item ratingKey → array of collection IDs the item belongs to
   private collectionMembershipCache?: Map<string, string[]>;
 
@@ -89,8 +90,48 @@ class OverlayLibraryService {
   private clearLibraryCaches() {
     this.radarrMoviesCache = new Map<string, RadarrMovie[]>();
     this.sonarrSeriesCache = new Map<string, SonarrSeries[]>();
-    this.maintainerrCollectionsCache = undefined;
+    // Not the Maintainerr collections: item jobs (quick sync, webhooks) run
+    // while a library job is in progress and share this service — wiping them
+    // made every item processed afterwards lose « deleting in X days ».
+    // loadMaintainerrCollections() refreshes them instead.
     this.collectionMembershipCache = undefined;
+  }
+
+  /**
+   * Maintainerr collections for daysUntilAction, shared by library and item
+   * jobs. Refetched when older than 5 min (or always with force).
+   */
+  private async loadMaintainerrCollections(force = false): Promise<void> {
+    const settings = getSettings();
+    if (!settings.maintainerr?.hostname || !settings.maintainerr?.apiKey) {
+      this.maintainerrCollectionsCache = undefined;
+      return;
+    }
+    if (
+      !force &&
+      this.maintainerrCollectionsCache &&
+      Date.now() - this.maintainerrCollectionsFetchedAt < 5 * 60 * 1000
+    ) {
+      return;
+    }
+    try {
+      const MaintainerrAPI = (await import('@server/api/maintainerr')).default;
+      const maintainerrClient = new MaintainerrAPI(settings.maintainerr);
+      const collections = await maintainerrClient.getCollections();
+      this.maintainerrCollectionsCache = collections;
+      this.maintainerrCollectionsFetchedAt = Date.now();
+      logger.info('Fetched Maintainerr collections for overlay job', {
+        label: 'OverlayLibrary',
+        collectionsCount: collections.length,
+      });
+    } catch (error) {
+      logger.error('Failed to fetch Maintainerr collections', {
+        label: 'OverlayLibrary',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Keep the previous list if there is one rather than dropping the badges.
+      this.maintainerrCollectionsCache ??= [];
+    }
   }
 
   /**
@@ -314,26 +355,7 @@ class OverlayLibraryService {
       });
 
       // Fetch Maintainerr collections once for the entire job
-      const settings = getSettings();
-      if (settings.maintainerr?.hostname && settings.maintainerr?.apiKey) {
-        try {
-          const MaintainerrAPI = (await import('@server/api/maintainerr'))
-            .default;
-          const maintainerrClient = new MaintainerrAPI(settings.maintainerr);
-          this.maintainerrCollectionsCache =
-            await maintainerrClient.getCollections();
-          logger.info('Fetched Maintainerr collections for overlay job', {
-            label: 'OverlayLibrary',
-            collectionsCount: this.maintainerrCollectionsCache.length,
-          });
-        } catch (error) {
-          logger.error('Failed to fetch Maintainerr collections', {
-            label: 'OverlayLibrary',
-            error: error instanceof Error ? error.message : String(error),
-          });
-          this.maintainerrCollectionsCache = [];
-        }
-      }
+      await this.loadMaintainerrCollections(true);
 
       // Get library items from Plex
       const { getAdminUser } = await import(
@@ -483,6 +505,8 @@ class OverlayLibraryService {
     try {
       // Clear library caches at start of job
       this.clearLibraryCaches();
+      // Item jobs need the Maintainerr collections too (they were never loaded here)
+      await this.loadMaintainerrCollections();
 
       // Normalize input to OverlayItemInput[]
       const normalizedItems: OverlayItemInput[] = items.map((item) =>
