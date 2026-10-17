@@ -1254,22 +1254,69 @@ class PlexBasePosterManager {
       });
     }
 
-    // Fallback: current Plex season poster
+    // Fallback: an ORIGINAL Plex poster of the season (local file or agent),
+    // never the current one — once overlays are applied the current poster is
+    // our own upload, and using it as a base stacks a new overlay on the old
+    // one at every run (seasons TMDB has no artwork for, e.g. anime).
     try {
-      const thumb =
-        plexThumb ||
-        ((await plexApi.getMetadata(seasonRatingKey)) as { thumb?: string })
-          .thumb;
-      if (thumb) {
-        return await this.downloadFromPlex(plexApi, thumb, seasonRatingKey);
+      const client = (
+        plexApi as unknown as {
+          plexClient: {
+            query: (
+              p: string
+            ) => Promise<{
+              MediaContainer?: {
+                Metadata?: {
+                  key?: string;
+                  ratingKey?: string;
+                  provider?: string;
+                }[];
+              };
+            }>;
+          };
+        }
+      ).plexClient;
+      const list =
+        (await client.query(`/library/metadata/${seasonRatingKey}/posters`))
+          ?.MediaContainer?.Metadata || [];
+      const original = list.find(
+        (p) => p.key && !String(p.ratingKey || '').startsWith('upload://')
+      );
+      if (original?.key) {
+        return await this.downloadFromPlex(
+          plexApi,
+          original.key,
+          seasonRatingKey
+        );
       }
     } catch (error) {
-      logger.warn('Failed to download Plex season poster fallback', {
+      logger.warn('Failed to read the original Plex season posters', {
         label: 'PlexBasePosterManager',
         seasonRatingKey,
         error: error instanceof Error ? error.message : String(error),
       });
     }
+
+    // Last resort: the show's TMDB poster (clean) rather than an overlaid one.
+    if (showTmdbId) {
+      try {
+        const posterUrl = await this.getTmdbPosterUrl(
+          showTmdbId,
+          'show',
+          language
+        );
+        if (posterUrl) {
+          const cached = await this.getTmdbCachedPoster(posterUrl);
+          if (cached) return cached;
+          const buffer = await this.downloadFromTMDB(posterUrl);
+          await this.storeTmdbCachedPoster(posterUrl, buffer);
+          return buffer;
+        }
+      } catch {
+        // no poster at all: the season is skipped
+      }
+    }
+    void plexThumb;
 
     return null;
   }
