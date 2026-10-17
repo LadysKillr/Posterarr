@@ -418,7 +418,9 @@ class PlexBasePosterManager {
       }:${settings.plex.port}`;
 
       // Build full URL with token
-      fullUrl = `${baseUrl}${downloadPath}?X-Plex-Token=${plexApi['plexToken']}`;
+      // Paths like /library/metadata/1/file?url=… already have a query string
+      const sep = downloadPath.includes('?') ? '&' : '?';
+      fullUrl = `${baseUrl}${downloadPath}${sep}X-Plex-Token=${plexApi['plexToken']}`;
     }
 
     const response = await axios.get(fullUrl, {
@@ -1259,26 +1261,10 @@ class PlexBasePosterManager {
     // our own upload, and using it as a base stacks a new overlay on the old
     // one at every run (seasons TMDB has no artwork for, e.g. anime).
     try {
-      const client = (
-        plexApi as unknown as {
-          plexClient: {
-            query: (
-              p: string
-            ) => Promise<{
-              MediaContainer?: {
-                Metadata?: {
-                  key?: string;
-                  ratingKey?: string;
-                  provider?: string;
-                }[];
-              };
-            }>;
-          };
-        }
-      ).plexClient;
-      const list =
-        (await client.query(`/library/metadata/${seasonRatingKey}/posters`))
-          ?.MediaContainer?.Metadata || [];
+      const list = (await plexApi.getAvailablePosters(seasonRatingKey)) as {
+        key?: string;
+        ratingKey?: string;
+      }[];
       const original = list.find(
         (p) => p.key && !String(p.ratingKey || '').startsWith('upload://')
       );
